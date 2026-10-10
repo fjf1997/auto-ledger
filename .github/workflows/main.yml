@@ -27,14 +27,7 @@ jobs:
       - name: Flutter 版本
         run: flutter --version
 
-      - name: 备份定制源码
-        run: |
-          mkdir -p /tmp/keep/kotlin
-          cp android/app/src/main/AndroidManifest.xml /tmp/keep/ 2>/dev/null || true
-          cp -r android/app/src/main/kotlin/. /tmp/keep/kotlin/ 2>/dev/null || true
-          ls -R /tmp/keep
-
-      - name: 重建 Android 原生工程
+      - name: 用官方模板生成 Android 原生工程
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
@@ -42,30 +35,216 @@ jobs:
           cd /tmp && rm -rf scaffold
           flutter create --org com.example --project-name auto_ledger --platforms=android scaffold
           cp -r /tmp/scaffold/android "$GITHUB_WORKSPACE/android"
+          echo "--- 模板 res 资源确认（必须非空）---"
+          ls "$GITHUB_WORKSPACE/android/app/src/main/res"
 
-      - name: 恢复定制源码（保留模板 res 资源）
+      - name: 写入定制 Manifest（OCR + 通知权限）
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          cat > android/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" />
+
+              <application
+                  android:label="随手记账"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <meta-data
+                          android:name="io.flutter.embedding.android.NormalTheme"
+                          android:resource="@style/NormalTheme" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".LedgerNotificationService"
+                      android:label="支付通知抓取"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <meta-data
+                      android:name="flutterEmbedding"
+                      android:value="2" />
+              </application>
+          </manifest>
+          EOF
+          echo "Manifest 写入完成"
+
+      - name: 写入原生 OCR 与通知服务源码
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
           mkdir -p android/app/src/main/kotlin/com/example/auto_ledger
-          [ -f /tmp/keep/AndroidManifest.xml ] && cp /tmp/keep/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-          [ -d /tmp/keep/kotlin ] && cp -r /tmp/keep/kotlin/. android/app/src/main/kotlin/com/example/auto_ledger/
+          cat > android/app/src/main/kotlin/com/example/auto_ledger/MainActivity.kt <<'EOF'
+          package com.example.auto_ledger
+
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.annotation.NonNull
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.EventChannel
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+
+          class MainActivity : FlutterActivity() {
+              override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "auto_ledger/ocr")
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "isAvailable" -> result.success(true)
+                              "recognizeText" -> {
+                                  val path = call.argument<String>("path")
+                                  if (path.isNullOrEmpty()) {
+                                      result.error("NO_PATH", "missing path", null)
+                                  } else {
+                                      recognize(path, result)
+                                  }
+                              }
+                              else -> result.notImplemented()
+                          }
+                      }
+
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "auto_ledger/notification")
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "hasPermission" -> result.success(NotificationSink.hasPermission(this))
+                              "openListenerSettings" -> {
+                                  val intent = android.content.Intent(
+                                      android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS
+                                  )
+                                  intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                  startActivity(intent)
+                                  result.success(true)
+                              }
+                              else -> result.notImplemented()
+                          }
+                      }
+
+                  EventChannel(flutterEngine.dartExecutor.binaryMessenger, "auto_ledger/notification_events")
+                      .setStreamHandler(object : EventChannel.StreamHandler {
+                          override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                              NotificationSink.sink = events
+                          }
+                          override fun onCancel(arguments: Any?) {
+                              NotificationSink.sink = null
+                          }
+                      })
+              }
+
+              private fun recognize(path: String, result: MethodChannel.Result) {
+                  try {
+                      val image = InputImage.fromFilePath(this, Uri.fromFile(File(path)))
+                      val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+                      recognizer.process(image)
+                          .addOnSuccessListener { t -> result.success(t.text) }
+                          .addOnFailureListener { e -> result.error("OCR_FAIL", e.message, null) }
+                          .addOnCompleteListener { recognizer.close() }
+                  } catch (e: Exception) {
+                      result.error("OCR_FAIL", e.message, null)
+                  }
+              }
+          }
+
+          object NotificationSink {
+              var sink: EventChannel.EventSink? = null
+              fun emit(text: String, pkg: String) {
+                  Handler(Looper.getMainLooper()).post {
+                      sink?.success(mapOf("text" to text, "package" to pkg))
+                  }
+              }
+              fun hasPermission(context: android.content.Context): Boolean {
+                  val flat = android.provider.Settings.Secure.getString(
+                      context.contentResolver, "enabled_notification_listeners"
+                  ) ?: return false
+                  return flat.contains(context.packageName)
+              }
+          }
+          EOF
+
+          cat > android/app/src/main/kotlin/com/example/auto_ledger/LedgerNotificationService.kt <<'EOF'
+          package com.example.auto_ledger
+
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          class LedgerNotificationService : NotificationListenerService() {
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  val n = sbn?.notification ?: return
+                  val pkg = sbn.packageName ?: return
+                  if (!WATCHED.contains(pkg)) return
+                  val e = n.extras
+                  val title = e.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+                  val text = e.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+                  val big = e.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString().orEmpty()
+                  val body = buildString {
+                      appendLine(title)
+                      appendLine(if (big.isNotBlank()) big else text)
+                  }.trim()
+                  if (body.isBlank()) return
+                  if (!AMOUNT.containsMatchIn(body)) return
+                  NotificationSink.emit(body, pkg)
+              }
+
+              override fun onNotificationRemoved(sbn: StatusBarNotification?) = Unit
+
+              companion object {
+                  private val WATCHED = setOf(
+                      "com.tencent.mm",
+                      "com.eg.android.AlipayGphone",
+                      "com.unionpay",
+                      "com.android.mms",
+                      "com.cmbchina.pb",
+                      "com.icbc",
+                      "com.ccb",
+                      "com.boc",
+                      "com.abchina",
+                      "com.bocom",
+                      "com.psbc"
+                  )
+                  private val AMOUNT = Regex("""[¥￥]|[0-9]+\.[0-9]{2}|元""")
+              }
+          }
+          EOF
           echo "--- 源码确认 ---"
           find android/app/src/main -name "*.kt" -o -name "AndroidManifest.xml"
-          echo "--- res 资源确认（必须有值）---"
-          ls android/app/src/main/res
 
       - name: 注入 ML Kit 依赖
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
           GF=""
-          [ -f android/app/build.gradle.kts ] && GF=android/app/build.gradle.kts
-          [ -f android/app/build.gradle ] && GF=android/app/build.gradle
-          echo "目标脚本: $GF"
-          [ -z "$GF" ] && exit 1
+          if [ -f android/app/build.gradle.kts ]; then GF=android/app/build.gradle.kts; fi
+          if [ -f android/app/build.gradle ]; then GF=android/app/build.gradle; fi
+          echo "构建脚本: $GF"
+          if [ -z "$GF" ]; then echo "找不到构建脚本"; exit 1; fi
           sed -i 's|^dependencies {|dependencies {\n    implementation("com.google.mlkit:text-recognition-chinese:16.0.0")|' "$GF"
-          echo "--- 校验 ---"
           grep -n "mlkit" "$GF"
 
       - name: flutter pub get
